@@ -7,6 +7,7 @@ Analyzes images to detect orientation and rotates them if needed.
 import os
 import base64
 from pathlib import Path
+from io import BytesIO
 from PIL import Image, ExifTags
 from openai import OpenAI
 import json
@@ -15,6 +16,13 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import threading
+
+try:
+    import cv2
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
+    np = None
 
 def setup_logging(log_file="image_processing.log"):
     """Setup dual logging to both console and file"""
@@ -49,11 +57,12 @@ def setup_logging(log_file="image_processing.log"):
     return logger
 
 class ImageOrientationFixer:
-    def __init__(self, api_key=None, max_workers=15, tracking_file="processed_images.json", log_file="image_processing.log"):
+    def __init__(self, api_key=None, max_workers=30, tracking_file="processed_images.json", log_file="image_processing.log"):
         """Initialize with OpenAI API key and concurrency settings"""
         self.client = OpenAI(api_key=api_key or os.getenv('OPENAI_API_KEY'))
         if not self.client.api_key:
             raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it directly.")
+        # Reuse one OpenAI client across threads and allow higher concurrency
         self.max_workers = max_workers
         self.progress_lock = Lock()
         self.processed_count = 0
@@ -87,9 +96,57 @@ class ImageOrientationFixer:
             self.logger.debug(f"Saved tracking data for {len(self.processed_images)} images")
         except Exception as e:
             self.logger.error(f"Could not save tracking file {self.tracking_file}: {e}")
+
+    def get_exif_rotation(self, image_path):
+        """Return (rotation, has_exif) based on EXIF orientation tag"""
+        try:
+            with Image.open(image_path) as img:
+                exif = img._getexif()
+                if not exif:
+                    return 0, False
+                for tag, value in exif.items():
+                    if ExifTags.TAGS.get(tag) == 'Orientation':
+                        mapping = {3: 180, 6: 270, 8: 90}
+                        return mapping.get(value, 0), True
+        except Exception as e:  # pragma: no cover - best effort
+            if hasattr(self, 'logger'):
+                self.logger.debug(f"Failed to read EXIF for {Path(image_path).name}: {e}")
+        return 0, False
+
+    def guess_orientation_locally(self, image_path):
+        """Attempt to guess orientation using a lightweight face detection heuristic"""
+        if cv2 is None or np is None:
+            return None
+        try:
+            with Image.open(image_path) as img:
+                img_copy = img.copy()
+                img_copy.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+                max_faces = 0
+                best_rotation = 0
+                for rotation in (0, 90, 180, 270):
+                    rotated = img_copy.rotate(rotation, expand=True)
+                    gray = cv2.cvtColor(np.array(rotated), cv2.COLOR_RGB2GRAY)
+                    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+                    if len(faces) > max_faces:
+                        max_faces = len(faces)
+                        best_rotation = rotation
+                if max_faces > 0:
+                    return best_rotation
+        except Exception as e:  # pragma: no cover - best effort
+            if hasattr(self, 'logger'):
+                self.logger.debug(f"Local heuristic failed for {Path(image_path).name}: {e}")
+        return None
     
-    def encode_image_to_base64(self, image_path):
-        """Encode image to base64 for API"""
+    def encode_image_to_base64(self, image_path, max_size=None):
+        """Encode image to base64, optionally resizing first"""
+        if max_size:
+            with Image.open(image_path) as img:
+                img_copy = img.copy()
+                img_copy.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                buffer = BytesIO()
+                img_copy.save(buffer, format="JPEG")
+                return base64.b64encode(buffer.getvalue()).decode("utf-8")
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
     
@@ -98,7 +155,8 @@ class ImageOrientationFixer:
         file_name = Path(image_path).name
         self.logger.info(f"Analyzing {file_name}...")
         
-        base64_image = self.encode_image_to_base64(image_path)
+        # Send a downsized copy to reduce upload and API time
+        base64_image = self.encode_image_to_base64(image_path, max_size=512)
         
         prompt = """Analyze this image and determine if it needs to be rotated to be properly oriented. 
 
@@ -191,18 +249,41 @@ If the image is already correctly oriented, use needs_rotation: false and rotati
         """Process a single image (thread-safe version)"""
         try:
             file_name = Path(image_path).name
-            
-            analysis = self.analyze_image_orientation(image_path)
-            
             was_rotated = False
-            if analysis["needs_rotation"] and analysis["rotation_degrees"] > 0:
+
+            # 1. Prefer EXIF orientation if present
+            rotation, has_exif = self.get_exif_rotation(image_path)
+            if has_exif:
+                analysis = {
+                    "needs_rotation": rotation > 0,
+                    "rotation_degrees": rotation,
+                    "confidence": "high",
+                    "reason": "EXIF orientation"
+                }
+            else:
+                # 2. Try local heuristic
+                local_rotation = self.guess_orientation_locally(image_path)
+                if local_rotation is not None:
+                    analysis = {
+                        "needs_rotation": local_rotation > 0,
+                        "rotation_degrees": local_rotation,
+                        "confidence": "medium",
+                        "reason": "local heuristic"
+                    }
+                    rotation = local_rotation
+                else:
+                    # 3. Fall back to Vision API
+                    analysis = self.analyze_image_orientation(image_path)
+                    rotation = analysis.get("rotation_degrees", 0)
+
+            if rotation and rotation > 0:
                 if output_dir:
                     output_path = Path(output_dir) / file_name
                     output_path.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     output_path = image_path
-                    
-                self.rotate_image(image_path, analysis["rotation_degrees"], str(output_path))
+
+                self.rotate_image(image_path, rotation, str(output_path))
                 was_rotated = True
             
             # Thread-safe progress and tracking update
@@ -358,7 +439,7 @@ def main():
     api_key = "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"
     input_dir = "/Users/bryceharmon/Desktop/photos_ending_in_a copy"
     output_dir = "./corrected_images"
-    max_workers = 15  # Optimal threading workers for good performance
+    max_workers = 30  # Increased concurrency for faster processing
     
     try:
         fixer = ImageOrientationFixer(api_key=api_key, max_workers=max_workers)
